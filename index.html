@@ -1,0 +1,1380 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta
+            name="viewport"
+            content="width=device-width,initial-scale=1,viewport-fit=cover"
+        />
+        <title>swirly · disco</title>
+        <style>
+            html,
+            body {
+                margin: 0;
+                height: 100%;
+                background: #000;
+                overflow: hidden;
+                font-family: ui-monospace, Menlo, monospace;
+                color: #eee;
+            }
+            canvas {
+                position: fixed;
+                inset: 0;
+                width: 100vw;
+                height: 100vh;
+                display: block;
+            }
+            #ui {
+                position: fixed;
+                left: 12px;
+                bottom: 10px;
+                font-size: 11px;
+                opacity: 0.6;
+                pointer-events: none;
+                text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
+                letter-spacing: 0.04em;
+            }
+            #ui span {
+                display: inline-block;
+                min-width: 2.4em;
+            }
+            #ui #rg {
+                min-width: auto;
+                color: #ffd166;
+                font-weight: 600;
+                letter-spacing: 0.12em;
+            }
+            #ui #nv {
+                min-width: 3em;
+            }
+            #start {
+                position: fixed;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: radial-gradient(
+                    ellipse at center,
+                    #1a0d24 0%,
+                    #000 70%
+                );
+                cursor: pointer;
+                transition: opacity 0.6s ease;
+                z-index: 10;
+            }
+            #start.hidden {
+                opacity: 0;
+                pointer-events: none;
+            }
+            #start .card {
+                text-align: center;
+                padding: 28px 36px;
+                border: 1px solid #5a2b6a;
+                border-radius: 14px;
+                background: rgba(40, 16, 56, 0.55);
+                backdrop-filter: blur(8px);
+                box-shadow: 0 0 60px rgba(255, 90, 200, 0.18) inset;
+            }
+            #start h1 {
+                margin: 0 0 6px;
+                font-size: 24px;
+                font-weight: 500;
+                letter-spacing: 0.16em;
+                background: linear-gradient(
+                    90deg,
+                    #ff63c8,
+                    #ffd166,
+                    #6cf,
+                    #ff63c8
+                );
+                -webkit-background-clip: text;
+                background-clip: text;
+                color: transparent;
+            }
+            #start p {
+                margin: 0;
+                font-size: 12px;
+                opacity: 0.75;
+            }
+            #start .hint {
+                margin-top: 14px;
+                font-size: 11px;
+                opacity: 0.5;
+            }
+        </style>
+    </head>
+    <body>
+        <canvas id="c"></canvas>
+        <div id="ui">
+            <span id="rg">DISCO FLOOR</span> · bass
+            <span id="bv">0.00</span> mid <span id="mv">0.00</span> hi
+            <span id="hv">0.00</span> · beat <span id="bts">0.00</span> · tens
+            <span id="tns">0.00</span> · whi <span id="whi">0.00</span> · nov
+            <span id="nv">0.00</span>
+        </div>
+        <div id="start">
+            <div class="card">
+                <h1>~ DISCO ~</h1>
+                <p>click to enter · grants microphone</p>
+                <div class="hint">no mic? still a party.</div>
+            </div>
+        </div>
+
+        <!-- dev-only live reload: polls Last-Modified on localhost, reloads on change. -->
+        <script>
+            (() => {
+                if (
+                    location.hostname !== "localhost" &&
+                    location.hostname !== "127.0.0.1"
+                )
+                    return;
+                let lastMod = null;
+                setInterval(async () => {
+                    try {
+                        const r = await fetch(location.pathname, {
+                            method: "HEAD",
+                            cache: "no-store",
+                        });
+                        const m = r.headers.get("last-modified");
+                        if (lastMod && m && m !== lastMod) location.reload();
+                        if (m) lastMod = m;
+                    } catch {}
+                }, 800);
+            })();
+        </script>
+
+        <script>
+            "use strict";
+
+            const canvas = document.getElementById("c");
+            const gl = canvas.getContext("webgl2", {
+                antialias: false,
+                alpha: false,
+                premultipliedAlpha: false,
+            });
+            if (!gl) {
+                document.body.innerHTML =
+                    "<p style='padding:20px'>WebGL2 unavailable.</p>";
+                throw new Error("no webgl2");
+            }
+
+            const SPEC_N = 64;
+
+            const VS = `#version 300 es
+in vec2 a;
+void main(){ gl_Position = vec4(a, 0.0, 1.0); }`;
+
+            const FS = `#version 300 es
+precision highp float;
+out vec4 o;
+
+uniform vec2  uRes;
+uniform float uTime;
+
+// smoothed (viscous) bands
+uniform float uBass, uMid, uHi;
+// raw bands — fast localized accents
+uniform float uBassRaw, uMidRaw, uHiRaw;
+// onset tails
+uniform float uOnBass, uOnMid, uOnHi;
+// spring-driven bouncy bass
+uniform float uBounce;
+// spectral centroid 0..1
+uniform float uCentroid;
+// phases / segments
+uniform float uSlow, uBeat, uSegments;
+
+// two palettes crossfaded by uPalMix
+uniform vec3 uPalA[4];
+uniform vec3 uPalB[4];
+uniform float uPalMix;
+
+// frequency → color *rotation*. Per-regime random weights for how each band
+// shifts the palette around the wheel. Spatial noise still owns the dominant
+// term in ci so the field has texture; these just rotate the color theme.
+uniform vec4  uColMap;       // (centroid, bass, mid, hi) palette-rotation weights
+uniform float uColBase;      // per-regime baseline offset (sets the "color zone")
+
+// regime coefficients — these crossfade slowly when the scene changes
+uniform float uRegSegOff;     // added to kaleidoscope base
+uniform float uRegTwist;      // twist amount multiplier
+uniform float uRegWarp;       // warp amount multiplier
+uniform float uRegRings;      // ring strength multiplier
+uniform float uRegSparkle;    // disco-ball twinkle multiplier
+uniform float uRegRays;       // sunburst ray multiplier
+uniform float uRegHue;        // additional hue rotation (added to ci)
+
+// switch flash — snaps to 1 the instant we change regime, decays fast.
+// boosts energy/glow to make the regime change felt as a "BOOP".
+uniform float uSwitchFlash;
+
+// derived "macro state" — all computed in JS from the feature bus.
+// brightness: global multiplier — sigmoid of absolute volume. ~0.12 when silent,
+//   ~0.45 default party loudness, ~0.75 peak. Saturates softly, never reaches 1.
+// energy: drives glow/vignette/saturation. similar to brightness but with a small
+//   tension boost so sustained novelty feels mildly more excited.
+// whiteout: gated mix toward white. Only nonzero on REAL big drops (vol+fullness
+//   excursion AND accumulated tension to spend).
+// beatPresence: smoothed onset density 0..1. Gates baseline glints/ring activity
+//   so a beat-less section is calm and a beat-driven section is engaged.
+uniform float uBrightness;
+uniform float uEnergy;
+uniform float uWhiteout;
+uniform float uBeatPresence;
+
+// 1-row R8 texture, SPEC_N pixels, auto-gained
+uniform sampler2D uSpectrum;
+
+#define TAU 6.28318530718
+#define PI  3.14159265359
+
+float hash(vec2 p){ p = fract(p*vec2(123.34, 456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }
+float vnoise(vec2 p){
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f*f*(3.0-2.0*f);
+  return mix(mix(hash(i), hash(i+vec2(1,0)), u.x),
+             mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), u.x), u.y);
+}
+float fbm(vec2 p){
+  float s = 0.0, a = 0.5;
+  mat2 r = mat2(0.8, -0.6, 0.6, 0.8);
+  for (int i = 0; i < 6; i++){
+    s += a * vnoise(p);
+    p = r * p * 2.02;
+    a *= 0.5;
+  }
+  return s;
+}
+
+vec3 palOne(float t, vec3 a, vec3 b, vec3 c, vec3 d){
+  return a + b * cos(TAU * (c*t + d));
+}
+vec3 pal(float t){
+  vec3 ca = palOne(t, uPalA[0], uPalA[1], uPalA[2], uPalA[3]);
+  vec3 cb = palOne(t, uPalB[0], uPalB[1], uPalB[2], uPalB[3]);
+  return mix(ca, cb, uPalMix);
+}
+
+mat2 rot(float a){ float s = sin(a), c = cos(a); return mat2(c, -s, s, c); }
+
+vec2 kaleido(vec2 p, float n){
+  float r = length(p);
+  float a = atan(p.y, p.x);
+  float seg = TAU / n;
+  a = mod(a, seg);
+  a = abs(a - seg * 0.5);
+  return vec2(cos(a), sin(a)) * r;
+}
+
+void main(){
+  vec2 frag = (gl_FragCoord.xy - 0.5*uRes) / min(uRes.x, uRes.y);
+
+  // pulse: gentle zoom centered on energy. Bouncy spring + switch flash on top.
+  float pulse = 0.88 + 0.30 * uEnergy + 0.10 * uBounce + 0.18 * uSwitchFlash;
+  vec2 p = frag / pulse;
+
+  float twist = (uSlow * 0.035 + 0.22 * sin(uSlow * 0.27) * (1.0 - exp(-2.2 * length(p)))) * uRegTwist;
+  p = rot(twist) * p;
+
+  float seg = max(3.0, uSegments + uRegSegOff + floor(uMid * 5.0 + uOnMid * 2.0));
+  p = kaleido(p, seg);
+
+  float t = uTime * 0.035 + uSlow * 0.10;
+  vec2 drift = 0.55 * vec2(sin(uSlow * 0.27), cos(uSlow * 0.19));
+  drift += 0.45 * vec2(uHi - uBass, uMid - 0.5*(uBass+uHi));
+
+  vec2 q = vec2(
+    fbm(p * 1.6 + drift + vec2(0.0, t)),
+    fbm(p * 1.6 + drift + vec2(5.2, -t))
+  );
+  vec2 r = vec2(
+    fbm(p * 2.7 + 4.0*q + vec2(1.7 + t*0.7, 9.2)),
+    fbm(p * 2.7 + 4.0*q + vec2(8.3, 2.8 - t*0.7))
+  );
+  float warpAmt = (0.7 + 1.0*uMid + 0.55*uBass + 0.35*uOnMid) * uRegWarp;
+  float n = fbm(p * 2.2 + warpAmt * r + 0.16 * uHi * sin(p.yx * 14.0 + uTime*0.7));
+
+  float rad = length(p);
+  // ring intensity fades when there's no beat — beatless sections stay smooth
+  float ringMod = mix(0.4, 1.0, uBeatPresence);
+  float rings = sin(rad * (5.5 + 6.0*uBass + 3.0*uOnMid) - uTime*0.28) * uRegRings * ringMod;
+  n = mix(n, n + 0.20*rings, 0.4);
+
+  // ---- color index ----
+  // Spatial terms DOMINATE so the field always has texture and color gradients
+  // across the frame (no flashing-in-unison). Audio terms add a smaller rotation
+  // around the palette wheel — randomized per regime for variety. The palette
+  // params themselves crossfade on regime swap, so two layers of color identity:
+  // (1) which palette is active, (2) which slice of it the music tunes us into.
+  float ci = n
+    + 0.18 * length(q)
+    + uColBase
+    + 0.30 * uCentroid * uColMap.x
+    + 0.15 * uBass * uColMap.y
+    + 0.15 * uMid  * uColMap.z
+    + 0.15 * uHi   * uColMap.w
+    + 0.005 * uTime
+    + uBeat * 0.05
+    + uRegHue * 0.4;
+  vec3 col = pal(ci);
+
+  // saturation push driven by energy — subtle, plus a kick during switches
+  float lum = dot(col, vec3(0.299, 0.587, 0.114));
+  col = mix(vec3(lum), col, 1.0 + 0.45 * uEnergy + 0.25 * uSwitchFlash);
+
+  col = mix(col, col*col*1.8, clamp(uBass*0.45, 0.0, 0.40));
+
+  // localized fast patches (raw bands)
+  float ridgeMask  = smoothstep(0.58, 0.86, n);
+  col += ridgeMask * uHiRaw * pal(ci + 0.42) * 0.55;
+  float troughMask = smoothstep(0.42, 0.12, n);
+  col += troughMask * uBassRaw * pal(ci - 0.18) * 0.40;
+  float edgeMask   = 1.0 - smoothstep(0.0, 0.18, abs(n - 0.5));
+  col += edgeMask * uMidRaw * pal(ci + 0.7) * 0.25;
+
+  // sunburst rays from spectrum (regime-scaled)
+  float ang = atan(p.y, p.x);
+  float su  = (ang + PI) / TAU;
+  float rayA = texture(uSpectrum, vec2(su,         0.5)).r;
+  float rayB = texture(uSpectrum, vec2(su + 0.003, 0.5)).r;
+  float ray  = max(rayA, rayB);
+  float rays = ray * exp(-1.3 * rad) * (0.35 + 0.70 * uEnergy) * uRegRays;
+  col += rays * pal(ci + 0.55) * 0.42;
+
+  // disco-ball twinkles (regime-scaled)
+  vec2 gp = p * 13.0 + vec2(uSlow*0.4, -uSlow*0.3);
+  vec2 cell = floor(gp);
+  float seedA = hash(cell);
+  float seedB = hash(cell + 17.31);
+  float gate = step(0.94, seedA);
+  float twinklePhase = seedB * TAU + uTime * (1.2 + 3.0 * seedA);
+  float twinkle = pow(max(0.0, sin(twinklePhase)), 10.0);
+  // Glints baseline gated by beat presence — when no beat detected they barely twinkle;
+  // when there's a clear rhythm, the room sparkles.
+  float glintBase = mix(0.05, 0.30, uBeatPresence);
+  float glint = gate * twinkle * (glintBase + 1.2 * uOnHi) * uRegSparkle;
+  col += glint * pal(ci + 0.85) * 0.45;
+
+  // global brightness — JS-computed sigmoid of absolute (auto-gained) volume.
+  // Quiet music sections still show clearly; only near-silence dips toward black.
+  col *= uBrightness;
+
+  // bass heartbeat + onset tint — color punches, not brightness pumps
+  col += pal(ci + 0.10) * (0.08 * uBass + 0.14 * uOnBass);
+
+  float glow = exp(-2.5 * rad) * (0.08 + 0.70 * uEnergy);
+  col += glow * pal(ci + 0.3) * 0.18;
+
+  // vignette breathes with energy
+  float vigOuter = 0.55 + 0.85 * uEnergy;
+  float vigInner = 0.05 + 0.10 * uEnergy;
+  col *= smoothstep(vigOuter, vigInner, rad);
+
+  // ---- sigmoid roll-off (tonemap) ----
+  // tighter exposure → overall darker. Built for dark rooms; headroom for additives
+  // without the cascade ever reaching pure white from accumulator stacking.
+  col = max(col, vec3(0.0));
+  col = vec3(1.0) - exp(-col * 0.95);
+
+  // ---- gated whiteout ----
+  // Computed in JS from a strict AND-gate (volume excursion AND fullness excursion)
+  // and modulated by accumulated tension. Genuinely rare — should fire only on real
+  // payoff moments. Switch flash adds a tiny white kick during regime swaps.
+  col = mix(col, vec3(1.0), clamp(uWhiteout + uSwitchFlash * 0.05, 0.0, 0.55));
+
+  float grain = (hash(gl_FragCoord.xy + fract(uTime)) - 0.5) * 0.04;
+  col += grain;
+
+  o = vec4(col, 1.0);
+}`;
+
+            function compile(type, src) {
+                const s = gl.createShader(type);
+                gl.shaderSource(s, src);
+                gl.compileShader(s);
+                if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+                    console.error(gl.getShaderInfoLog(s));
+                    throw new Error("shader compile failed");
+                }
+                return s;
+            }
+
+            const prog = gl.createProgram();
+            gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+            gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+            gl.bindAttribLocation(prog, 0, "a");
+            gl.linkProgram(prog);
+            if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+                throw new Error(gl.getProgramInfoLog(prog));
+            gl.useProgram(prog);
+
+            const vbo = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+            gl.bufferData(
+                gl.ARRAY_BUFFER,
+                new Float32Array([-1, -1, 3, -1, -1, 3]),
+                gl.STATIC_DRAW,
+            );
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+            const U = {
+                res: gl.getUniformLocation(prog, "uRes"),
+                time: gl.getUniformLocation(prog, "uTime"),
+                bass: gl.getUniformLocation(prog, "uBass"),
+                mid: gl.getUniformLocation(prog, "uMid"),
+                hi: gl.getUniformLocation(prog, "uHi"),
+                bassRaw: gl.getUniformLocation(prog, "uBassRaw"),
+                midRaw: gl.getUniformLocation(prog, "uMidRaw"),
+                hiRaw: gl.getUniformLocation(prog, "uHiRaw"),
+                onBass: gl.getUniformLocation(prog, "uOnBass"),
+                onMid: gl.getUniformLocation(prog, "uOnMid"),
+                onHi: gl.getUniformLocation(prog, "uOnHi"),
+                bounce: gl.getUniformLocation(prog, "uBounce"),
+                centroid: gl.getUniformLocation(prog, "uCentroid"),
+                beat: gl.getUniformLocation(prog, "uBeat"),
+                slow: gl.getUniformLocation(prog, "uSlow"),
+                seg: gl.getUniformLocation(prog, "uSegments"),
+                palA: gl.getUniformLocation(prog, "uPalA"),
+                palB: gl.getUniformLocation(prog, "uPalB"),
+                palMix: gl.getUniformLocation(prog, "uPalMix"),
+                regSegOff: gl.getUniformLocation(prog, "uRegSegOff"),
+                regTwist: gl.getUniformLocation(prog, "uRegTwist"),
+                regWarp: gl.getUniformLocation(prog, "uRegWarp"),
+                regRings: gl.getUniformLocation(prog, "uRegRings"),
+                regSparkle: gl.getUniformLocation(prog, "uRegSparkle"),
+                regRays: gl.getUniformLocation(prog, "uRegRays"),
+                regHue: gl.getUniformLocation(prog, "uRegHue"),
+                switchFlash: gl.getUniformLocation(prog, "uSwitchFlash"),
+                brightness: gl.getUniformLocation(prog, "uBrightness"),
+                energy: gl.getUniformLocation(prog, "uEnergy"),
+                whiteout: gl.getUniformLocation(prog, "uWhiteout"),
+                beatPresence: gl.getUniformLocation(prog, "uBeatPresence"),
+                colMap: gl.getUniformLocation(prog, "uColMap"),
+                colBase: gl.getUniformLocation(prog, "uColBase"),
+                spectrum: gl.getUniformLocation(prog, "uSpectrum"),
+            };
+
+            // ---- spectrum texture (R8) ----
+            const specTex = gl.createTexture();
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, specTex);
+            gl.texImage2D(
+                gl.TEXTURE_2D,
+                0,
+                gl.R8,
+                SPEC_N,
+                1,
+                0,
+                gl.RED,
+                gl.UNSIGNED_BYTE,
+                new Uint8Array(SPEC_N),
+            );
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+            gl.texParameteri(
+                gl.TEXTURE_2D,
+                gl.TEXTURE_WRAP_T,
+                gl.CLAMP_TO_EDGE,
+            );
+            gl.uniform1i(U.spectrum, 0);
+            const specBytes = new Uint8Array(SPEC_N);
+
+            function resize() {
+                const dpr = Math.min(window.devicePixelRatio || 1, 2);
+                const w = Math.floor(innerWidth * dpr);
+                const h = Math.floor(innerHeight * dpr);
+                if (canvas.width !== w || canvas.height !== h) {
+                    canvas.width = w;
+                    canvas.height = h;
+                }
+                gl.viewport(0, 0, w, h);
+            }
+            resize();
+            addEventListener("resize", resize);
+
+            // ---------- audio ----------
+            let analyser = null,
+                freq = null,
+                audioCtx = null;
+            let onsetNode = null,
+                onsetSink = null;
+
+            // AudioWorklet: runs in the audio thread, processing every 128 samples (~2.7ms @ 48kHz).
+            // It runs three IIR bandpass filters (bass/mid/hi), tracks per-block RMS energy,
+            // computes spectral flux per band, and posts an onset message when flux crosses an
+            // adaptive threshold. Onsets land in the main thread within ~3ms instead of waiting
+            // for the next animation frame (~16ms granularity). Big perceptual win on snares/hihats.
+            const WORKLET_CODE = `
+function makeBP(f0, Q, sr) {
+  const w0 = 2 * Math.PI * f0 / sr;
+  const alpha = Math.sin(w0) / (2 * Q);
+  const a0 = 1 + alpha;
+  return {
+    b0: alpha / a0,
+    b2: -alpha / a0,
+    a1: -2 * Math.cos(w0) / a0,
+    a2: (1 - alpha) / a0,
+    x1: 0, x2: 0, y1: 0, y2: 0,
+    step(x) {
+      const y = this.b0*x + this.b2*this.x2 - this.a1*this.y1 - this.a2*this.y2;
+      this.x2 = this.x1; this.x1 = x;
+      this.y2 = this.y1; this.y1 = y;
+      return y;
+    }
+  };
+}
+
+class OnsetProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    const sr = sampleRate;
+    this.bp = {
+      bass: makeBP(150,  1.0, sr),
+      mid:  makeBP(900,  1.0, sr),
+      hi:   makeBP(4500, 0.9, sr),
+    };
+    this.lastE = { bass: 0, mid: 0, hi: 0 };
+    this.fluxAvg = { bass: 0.001, mid: 0.001, hi: 0.001 };
+    this.energyAvg = { bass: 0.001, mid: 0.001, hi: 0.001 };
+    this.refr = { bass: 0, mid: 0, hi: 0 }; // refractory countdown in samples
+    this.refrSamples = {
+      bass: Math.floor(0.180 * sr),
+      mid:  Math.floor(0.110 * sr),
+      hi:   Math.floor(0.070 * sr),
+    };
+  }
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || !input[0] || input[0].length === 0) return true;
+    const ch = input[0];
+    const N = ch.length;
+    let sB = 0, sM = 0, sH = 0;
+    const fb = this.bp.bass, fm = this.bp.mid, fh = this.bp.hi;
+    for (let i = 0; i < N; i++) {
+      const s = ch[i];
+      const b = fb.step(s), m = fm.step(s), h = fh.step(s);
+      sB += b*b; sM += m*m; sH += h*h;
+    }
+    const eB = Math.sqrt(sB / N);
+    const eM = Math.sqrt(sM / N);
+    const eH = Math.sqrt(sH / N);
+
+    this.energyAvg.bass = this.energyAvg.bass * 0.92 + eB * 0.08;
+    this.energyAvg.mid  = this.energyAvg.mid  * 0.92 + eM * 0.08;
+    this.energyAvg.hi   = this.energyAvg.hi   * 0.92 + eH * 0.08;
+
+    const flB = Math.max(0, eB - this.lastE.bass);
+    const flM = Math.max(0, eM - this.lastE.mid);
+    const flH = Math.max(0, eH - this.lastE.hi);
+    this.lastE.bass = eB; this.lastE.mid = eM; this.lastE.hi = eH;
+
+    this.fluxAvg.bass = this.fluxAvg.bass * 0.93 + flB * 0.07;
+    this.fluxAvg.mid  = this.fluxAvg.mid  * 0.93 + flM * 0.07;
+    this.fluxAvg.hi   = this.fluxAvg.hi   * 0.93 + flH * 0.07;
+
+    if (this.refr.bass > 0) this.refr.bass -= N;
+    if (this.refr.mid  > 0) this.refr.mid  -= N;
+    if (this.refr.hi   > 0) this.refr.hi   -= N;
+
+    const fire = (band, flux, energy) => {
+      // need flux above adaptive threshold AND a non-trivial energy floor
+      // (avoids triggering on hiss when the room is silent).
+      if (flux > this.fluxAvg[band] * 1.7 + 0.003
+          && this.refr[band] <= 0
+          && energy > Math.max(0.004, this.energyAvg[band] * 0.5)) {
+        // strength normalized vs the running flux — bigger surprise = stronger onset
+        const strength = Math.min(1.0, flux / Math.max(this.fluxAvg[band] * 6, 0.03));
+        this.port.postMessage({ band, strength });
+        this.refr[band] = this.refrSamples[band];
+      }
+    };
+    fire('bass', flB, eB);
+    fire('mid',  flM, eM);
+    fire('hi',   flH, eH);
+    return true;
+  }
+}
+registerProcessor('onset-processor', OnsetProcessor);
+`;
+
+            async function startAudio() {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            echoCancellation: false,
+                            noiseSuppression: false,
+                            autoGainControl: false,
+                        },
+                    });
+                    audioCtx = new (
+                        window.AudioContext || window.webkitAudioContext
+                    )();
+                    if (audioCtx.state === "suspended") await audioCtx.resume();
+                    const src = audioCtx.createMediaStreamSource(stream);
+
+                    // AnalyserNode kept for spectrum (rays) + viscous bands. Tightened for low latency:
+                    // smaller FFT window (10.7ms @ 48kHz) and zero internal smoothing — we do our own
+                    // smoothing in JS where we can tune attack/release per-signal.
+                    analyser = audioCtx.createAnalyser();
+                    analyser.fftSize = 512;
+                    analyser.smoothingTimeConstant = 0.0;
+                    src.connect(analyser);
+                    freq = new Uint8Array(analyser.frequencyBinCount);
+
+                    // AudioWorklet — onset detection at audio-block rate. Fall back gracefully if
+                    // the browser refuses to load the worklet (very old browsers, file:// quirks).
+                    try {
+                        const blob = new Blob([WORKLET_CODE], {
+                            type: "application/javascript",
+                        });
+                        const url = URL.createObjectURL(blob);
+                        await audioCtx.audioWorklet.addModule(url);
+                        URL.revokeObjectURL(url);
+                        onsetNode = new AudioWorkletNode(
+                            audioCtx,
+                            "onset-processor",
+                        );
+                        // keep the node alive in the audio graph via a silent gain to destination.
+                        // process() only runs when the node has an output reference somewhere.
+                        onsetSink = audioCtx.createGain();
+                        onsetSink.gain.value = 0;
+                        src.connect(onsetNode);
+                        onsetNode
+                            .connect(onsetSink)
+                            .connect(audioCtx.destination);
+                        onsetNode.port.onmessage = handleOnsetMessage;
+                    } catch (werr) {
+                        console.warn(
+                            "AudioWorklet unavailable; onsets disabled (visuals still react to bands):",
+                            werr,
+                        );
+                    }
+                } catch (err) {
+                    console.warn(
+                        "mic denied/unavailable, running silent:",
+                        err,
+                    );
+                }
+            }
+
+            // fired by the worklet whenever a band's flux crosses threshold. We refresh the
+            // onset envelope, kick the bouncy spring on bass, and advance beatPhase on bass.
+            function handleOnsetMessage(e) {
+                const { band, strength } = e.data;
+                const s = Math.min(1.0, Math.max(0.0, strength));
+                onset[band] = Math.max(onset[band], s);
+                recordOnsetEvent(performance.now());
+                if (band === "bass") {
+                    bounceV += 5.5 * (0.4 + s);
+                    beatPhase += 0.18 + s * 0.25;
+                }
+            }
+
+            function band(lo, hi) {
+                if (!freq) return 0;
+                let s = 0,
+                    n = 0;
+                const a = Math.max(0, lo | 0),
+                    b = Math.min(freq.length, hi | 0);
+                for (let i = a; i < b; i++) {
+                    s += freq[i];
+                    n++;
+                }
+                return n > 0 ? s / n / 255 : 0;
+            }
+
+            // ---------- envelopes ----------
+            const env = { bass: 0, mid: 0, hi: 0, vol: 0 };
+            const ATTACK_SOFT = 0.08,
+                ATTACK_MED = 0.14;
+            const RELEASE_OOZE = 0.012,
+                RELEASE_SLOW = 0.025;
+            function follow(prev, target, attack, release) {
+                const k = target > prev ? attack : release;
+                return prev + (target - prev) * k;
+            }
+            function smoothstep01(a, b, x) {
+                if (b <= a) return x < a ? 0 : 1;
+                const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
+                return t * t * (3 - 2 * t);
+            }
+
+            // per-band auto-gain
+            const gain = { bass: 0.05, mid: 0.05, hi: 0.05 };
+            const GAIN_DECAY = 0.9985;
+            function autoGain(name, value) {
+                gain[name] = Math.max(gain[name] * GAIN_DECAY, value, 0.04);
+                return Math.min(1, value / gain[name]);
+            }
+
+            // onset envelope tails — refreshed by the worklet, decayed in frame() each tick.
+            const onset = { bass: 0, mid: 0, hi: 0 };
+            const ONSET_DECAY = { bass: 2.2, mid: 2.6, hi: 3.2 };
+
+            // bouncy bass spring
+            let bounceY = 0,
+                bounceV = 0;
+            const BOUNCE_K = 90,
+                BOUNCE_D = 6.5;
+
+            let beatPhase = 0,
+                beatPhaseSmooth = 0;
+            let slowPhase = 0;
+            let segments = 6;
+            let segmentDriftAt = 0;
+            const raw = { bass: 0, mid: 0, hi: 0 };
+
+            let centroidSmooth = 0.5;
+
+            // ---------- multi-channel feature bus ----------
+            // Each channel tracks: raw value, short EMA, long EMA, running |deviation|, and
+            // the normalized deviation signal in -1..+1 (short vs long, autoscaled).
+            // Channels:
+            //   volume       — overall loudness (auto-gained band mean)
+            //   fullness     — broadband-ness (geometric mean of bands)
+            //   centroid     — where in the spectrum the energy lives
+            //   onsetDensity — onsets per second over the last 3s (rhythm presence)
+            //   flux         — sum of positive bin changes per frame (spectrum motion)
+            function makeChan() {
+                return { raw: 0, short: 0, long: 0, absDev: 0.05, dev: 0 };
+            }
+            const feat = {
+                volume: makeChan(),
+                fullness: makeChan(),
+                centroid: makeChan(),
+                onsetDensity: makeChan(),
+                flux: makeChan(),
+            };
+            const F_SHORT_RATE = 2.5; // ~0.4s settle — "right now"
+            const F_LONG_RATE = 0.05; // ~10s settle — "this song's recent character"
+            const F_ABSDEV_RATE = 0.3; // ~3s — autoscale window for normalizing dev magnitudes
+            function updateChan(ch, value, dt) {
+                ch.raw = value;
+                const ks = Math.min(1, dt * F_SHORT_RATE);
+                const kl = Math.min(1, dt * F_LONG_RATE);
+                const ka = Math.min(1, dt * F_ABSDEV_RATE);
+                ch.short += (value - ch.short) * ks;
+                ch.long += (value - ch.long) * kl;
+                const d = ch.short - ch.long;
+                ch.absDev += (Math.abs(d) - ch.absDev) * ka;
+                ch.dev = Math.max(
+                    -1,
+                    Math.min(1, d / Math.max(ch.absDev * 1.5, 0.04)),
+                );
+            }
+
+            // ring buffer of recent onset timestamps for density (any band counts).
+            const onsetTimes = [];
+            function recordOnsetEvent(now) {
+                onsetTimes.push(now);
+                while (onsetTimes.length && now - onsetTimes[0] > 3000)
+                    onsetTimes.shift();
+            }
+            function onsetDensityNow() {
+                return onsetTimes.length / 3.0;
+            } // events per second
+
+            // spectral flux: sum of positive bin changes per frame. computed off the spectrum
+            // texture buffer (already log-bucketed and auto-gained), so it gives a clean
+            // "the spectrum just moved a lot" signal independent of overall volume.
+            const prevSpec = new Uint8Array(SPEC_N);
+            function spectralFluxNow() {
+                let f = 0;
+                for (let i = 0; i < SPEC_N; i++) {
+                    const d = specBytes[i] - prevSpec[i];
+                    if (d > 0) f += d;
+                    prevSpec[i] = specBytes[i];
+                }
+                return f / (255 * SPEC_N); // normalize roughly to 0..1
+            }
+
+            // tension: an accumulator that builds with sustained novelty across channels and
+            // decays slowly when audio is steady. Drives whiteout intensity (gated) and
+            // nudges regime selection toward higher-energy regimes when high. Thermodynamics:
+            // audio "heats" the system; absent any input, it cools back to ground state.
+            let tension = 0;
+            const TENSION_GAIN = 0.22; // how fast positive deviations charge tension
+            const TENSION_DECAY = 0.08; // 1/s — ~12s decay timeconstant when idle
+            const TENSION_MAX = 2.0;
+
+            // derived display values that feed the shader
+            let uBrightnessVal = 0.2;
+            let uEnergyVal = 0.2;
+            let uWhiteoutVal = 0;
+            let uBeatPresenceVal = 0;
+
+            // ---------- color mapping ----------
+            // Audio rotates the palette around the wheel. Spatial noise still owns the dominant
+            // term in the palette index; these weights just shift WHERE in the palette each
+            // pixel lands. Re-randomized at every regime switch so each section of the song
+            // "speaks" a different color language while keeping spatial structure intact.
+            let colMap = { x: 0.5, y: 0.0, z: 0.0, w: 0.0 };
+            let colBase = 0.0;
+            function randomizeColorMap() {
+                const r = () => Math.random() * 2 - 1;
+                colMap = {
+                    x: 0.3 + 0.6 * Math.random(), // centroid weight, biased positive (most musical axis)
+                    y: 0.7 * r(), // bass: -0.7..0.7
+                    z: 0.7 * r(), // mid
+                    w: 0.7 * r(), // hi
+                };
+                colBase = Math.random(); // sets the regime's resting "color zone" on the palette
+            }
+            randomizeColorMap();
+
+            // ---------- palettes ----------
+            const PALETTES = [
+                // 0 hot pink / cyan
+                [
+                    [0.5, 0.5, 0.5],
+                    [0.5, 0.5, 0.5],
+                    [1.0, 1.0, 1.0],
+                    [0.0, 0.1, 0.2],
+                ],
+                // 1 gold / magenta / lime
+                [
+                    [0.55, 0.45, 0.5],
+                    [0.5, 0.55, 0.45],
+                    [0.9, 1.0, 0.7],
+                    [0.45, 0.2, 0.1],
+                ],
+                // 2 electric blue / yellow
+                [
+                    [0.5, 0.5, 0.5],
+                    [0.5, 0.5, 0.5],
+                    [1.0, 1.0, 0.5],
+                    [0.8, 0.9, 0.3],
+                ],
+                // 3 tangerine / cherry / cream
+                [
+                    [0.6, 0.4, 0.4],
+                    [0.4, 0.5, 0.4],
+                    [1.0, 1.0, 1.0],
+                    [0.0, 0.25, 0.5],
+                ],
+                // 4 mint / coral / lilac
+                [
+                    [0.5, 0.5, 0.5],
+                    [0.4, 0.45, 0.5],
+                    [0.7, 1.0, 1.0],
+                    [0.25, 0.3, 0.55],
+                ],
+                // 5 hot magenta / orange (Studio 54 sign)
+                [
+                    [0.55, 0.4, 0.45],
+                    [0.45, 0.5, 0.5],
+                    [2.0, 1.0, 1.0],
+                    [0.5, 0.2, 0.25],
+                ],
+            ];
+            function flatPal(idx) {
+                const p = PALETTES[idx];
+                return new Float32Array([...p[0], ...p[1], ...p[2], ...p[3]]);
+            }
+            let palCurIdx = 0,
+                palNextIdx = 1;
+            let palCur = flatPal(palCurIdx);
+            let palNext = flatPal(palNextIdx);
+            let palMix = 1;
+            const PAL_SWAP_DURATION = 1.6;
+
+            function swapPaletteTo(idx) {
+                if (idx === palCurIdx) return;
+                palNextIdx = idx;
+                palNext = flatPal(palNextIdx);
+                palMix = 0;
+            }
+
+            // ---------- regimes ----------
+            // Each regime is a bundle of multipliers + a list of palette indices it likes.
+            // Regime params crossfade smoothly between current and target on a switch.
+            const REGIMES = [
+                {
+                    name: "DISCO FLOOR",
+                    p: {
+                        segOff: 0,
+                        twist: 1.0,
+                        warp: 1.0,
+                        rings: 1.0,
+                        sparkle: 1.0,
+                        rays: 1.0,
+                        hue: 0.0,
+                    },
+                    palettes: [0, 2, 5],
+                },
+                {
+                    name: "MIRROR BALL",
+                    p: {
+                        segOff: 2,
+                        twist: 0.5,
+                        warp: 0.6,
+                        rings: 0.3,
+                        sparkle: 2.6,
+                        rays: 1.5,
+                        hue: 0.1,
+                    },
+                    palettes: [0, 4],
+                },
+                {
+                    name: "VORTEX",
+                    p: {
+                        segOff: -2,
+                        twist: 2.4,
+                        warp: 1.6,
+                        rings: 1.5,
+                        sparkle: 0.3,
+                        rays: 1.8,
+                        hue: 0.4,
+                    },
+                    palettes: [3, 5],
+                },
+                {
+                    name: "LAVA LAMP",
+                    p: {
+                        segOff: -2,
+                        twist: 1.4,
+                        warp: 2.0,
+                        rings: 0.5,
+                        sparkle: 0.0,
+                        rays: 0.3,
+                        hue: 0.55,
+                    },
+                    palettes: [3],
+                },
+                {
+                    name: "AURORA",
+                    p: {
+                        segOff: 4,
+                        twist: 0.7,
+                        warp: 0.8,
+                        rings: 0.7,
+                        sparkle: 1.8,
+                        rays: 0.6,
+                        hue: 0.7,
+                    },
+                    palettes: [4, 1],
+                },
+            ];
+            const PARAM_KEYS = [
+                "segOff",
+                "twist",
+                "warp",
+                "rings",
+                "sparkle",
+                "rays",
+                "hue",
+            ];
+
+            // current and target regime coefficient vectors — these lerp on a switch.
+            let regimeIdx = 0;
+            const regimeCur = { ...REGIMES[0].p };
+            const regimeTarget = { ...REGIMES[0].p };
+            const REGIME_COOLDOWN_MS = 8000; // min interval between switches
+            const NOVELTY_THRESHOLD = 0.42; // tune by feel
+            let lastRegimeSwitchAt = -100000;
+
+            let switchFlash = 0; // decays after each switch
+
+            // novelty across the feature bus — sum of |dev| of the channels that matter
+            // for "the song just changed character". Used both for regime-switch detection
+            // and as one input to tension.
+            function noveltyNow() {
+                return (
+                    1.6 * Math.abs(feat.volume.dev) +
+                    1.4 * Math.abs(feat.fullness.dev) +
+                    1.6 * Math.abs(feat.flux.dev) +
+                    1.0 * Math.abs(feat.centroid.dev) +
+                    0.8 * Math.abs(feat.onsetDensity.dev)
+                );
+            }
+
+            // regime picker with thermodynamic bias. high tension + high positive vol/flux dev
+            // = "system is hot" → favor energetic regimes. Low energy → favor chill regimes.
+            // The chill regimes act as ground states the system naturally decays into.
+            function pickNextRegime() {
+                const heat =
+                    tension * 0.5 +
+                    Math.max(0, feat.volume.dev) * 0.7 +
+                    Math.max(0, feat.flux.dev) * 0.7 +
+                    Math.max(0, feat.fullness.dev) * 0.4;
+                const scores = REGIMES.map((r, i) => {
+                    if (i === regimeIdx) return -1;
+                    let s = Math.random() * 0.4;
+                    const isChill =
+                        r.name === "AURORA" || r.name === "LAVA LAMP";
+                    const isHot =
+                        r.name === "VORTEX" || r.name === "DISCO FLOOR";
+                    const isSparkly = r.name === "MIRROR BALL";
+                    // chill regimes get a bonus when heat is low, penalty when heat is high
+                    if (isChill) s += 1.4 - heat * 1.6;
+                    if (isHot) s += 0.4 + heat * 1.0;
+                    if (isSparkly)
+                        s += 0.6 + 0.8 * Math.max(0, feat.centroid.dev);
+                    // additional spectral matching
+                    if (r.name === "VORTEX")
+                        s += 0.8 * Math.max(0, feat.volume.short - 0.3);
+                    if (r.name === "AURORA")
+                        s += 0.6 * Math.max(0, feat.centroid.short - 0.4);
+                    if (r.name === "LAVA LAMP")
+                        s += 0.8 * Math.max(0, 0.4 - feat.volume.short);
+                    return s;
+                });
+                let best = 0,
+                    bestScore = -Infinity;
+                for (let i = 0; i < scores.length; i++)
+                    if (scores[i] > bestScore) {
+                        bestScore = scores[i];
+                        best = i;
+                    }
+                return best;
+            }
+
+            function switchRegime(now) {
+                const next = pickNextRegime();
+                regimeIdx = next;
+                Object.assign(regimeTarget, REGIMES[next].p);
+                lastRegimeSwitchAt = now;
+                switchFlash = 1.0; // BOOP
+                // also trigger a palette swap to one of the new regime's preferred palettes
+                const choices = REGIMES[next].palettes.filter(
+                    (i) => i !== palCurIdx,
+                );
+                const pick = choices.length
+                    ? choices[(Math.random() * choices.length) | 0]
+                    : REGIMES[next].palettes[0];
+                swapPaletteTo(pick);
+                // re-roll the freq→color mapping so this regime "speaks" a new color language
+                randomizeColorMap();
+                rgEl.textContent = REGIMES[next].name;
+            }
+
+            // ---------- spectrum texture ----------
+            let specMax = 1;
+            function updateSpectrum() {
+                if (!freq) {
+                    specBytes.fill(0);
+                } else {
+                    const N = freq.length;
+                    let frameMax = 0;
+                    for (let i = 0; i < SPEC_N; i++) {
+                        const t0 = i / SPEC_N,
+                            t1 = (i + 1) / SPEC_N;
+                        const a = Math.floor(2 + Math.pow(t0, 1.7) * (N - 4));
+                        const b = Math.max(
+                            a + 1,
+                            Math.floor(2 + Math.pow(t1, 1.7) * (N - 4)),
+                        );
+                        let m = 0;
+                        for (let j = a; j < b; j++)
+                            if (freq[j] > m) m = freq[j];
+                        specBytes[i] = m;
+                        if (m > frameMax) frameMax = m;
+                    }
+                    specMax = Math.max(specMax * 0.995, frameMax, 32);
+                    const scale = 255 / specMax;
+                    for (let i = 0; i < SPEC_N; i++) {
+                        const v = specBytes[i] * scale;
+                        specBytes[i] = v > 255 ? 255 : v | 0;
+                    }
+                }
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, specTex);
+                gl.texSubImage2D(
+                    gl.TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    SPEC_N,
+                    1,
+                    gl.RED,
+                    gl.UNSIGNED_BYTE,
+                    specBytes,
+                );
+            }
+
+            function computeCentroid() {
+                if (!freq) return 0.5;
+                let num = 0,
+                    denom = 0;
+                const N = freq.length;
+                const invLogN = 1 / Math.log2(N);
+                for (let i = 2; i < N; i++) {
+                    const v = freq[i];
+                    num += v * Math.log2(i + 1) * invLogN;
+                    denom += v;
+                }
+                return denom > 1 ? num / denom : 0.5;
+            }
+
+            const bv = document.getElementById("bv");
+            const mv = document.getElementById("mv");
+            const hv = document.getElementById("hv");
+            const nv = document.getElementById("nv");
+            const btsEl = document.getElementById("bts");
+            const tnsEl = document.getElementById("tns");
+            const whiEl = document.getElementById("whi");
+            const rgEl = document.getElementById("rg");
+
+            const t0 = performance.now();
+            let lastFrame = t0;
+
+            function frame(now) {
+                const t = (now - t0) / 1000;
+                const dt = Math.min(0.05, (now - lastFrame) / 1000);
+                lastFrame = now;
+
+                let bass = 0,
+                    mid = 0,
+                    hi = 0;
+                if (analyser) {
+                    analyser.getByteFrequencyData(freq);
+                    // bin width ≈ 94 Hz at fftSize=512/48kHz. recompute band ranges accordingly.
+                    bass = band(1, 4); // ~94..375 Hz
+                    mid = band(4, 25); // ~375..2344 Hz
+                    hi = band(25, 90); // ~2344..8438 Hz
+                }
+                bass = Math.pow(bass, 0.85) * 1.3;
+
+                const bassN = autoGain("bass", bass);
+                const midN = autoGain("mid", mid);
+                const hiN = autoGain("hi", hi);
+                const volN = (bassN + midN + hiN) / 3;
+
+                raw.bass = bassN;
+                raw.mid = midN;
+                raw.hi = hiN;
+
+                env.bass = follow(env.bass, bassN, ATTACK_SOFT, RELEASE_OOZE);
+                env.mid = follow(env.mid, midN, ATTACK_SOFT, RELEASE_SLOW);
+                env.hi = follow(env.hi, hiN, ATTACK_MED, RELEASE_SLOW);
+                env.vol = follow(env.vol, volN, ATTACK_SOFT, RELEASE_OOZE);
+
+                // onset tails decay each frame (impulses into onset[] come from the worklet)
+                for (const k of ["bass", "mid", "hi"]) {
+                    onset[k] = Math.max(0, onset[k] * (1 - dt * ONSET_DECAY[k]));
+                }
+
+                // bouncy bass spring — impulses arrive from the worklet via handleOnsetMessage
+                bounceV += -BOUNCE_K * bounceY * dt;
+                bounceV *= Math.exp(-BOUNCE_D * dt);
+                bounceY += bounceV * dt;
+
+                beatPhase += dt * 0.05;
+                beatPhaseSmooth +=
+                    (beatPhase - beatPhaseSmooth) * Math.min(1, dt * 1.6);
+
+                const centroidNow = computeCentroid();
+                centroidSmooth +=
+                    (centroidNow - centroidSmooth) * Math.min(1, dt * 1.2);
+
+                // ---- feature bus update ----
+                const fullnessRaw = Math.cbrt(Math.max(0, bassN * midN * hiN));
+                updateChan(feat.volume, volN, dt);
+                updateChan(feat.fullness, fullnessRaw, dt);
+                updateChan(feat.centroid, centroidSmooth, dt);
+                updateChan(feat.onsetDensity, onsetDensityNow(), dt);
+                updateChan(feat.flux, spectralFluxNow(), dt);
+
+                // ---- tension: charges from positive deviations, decays slowly ----
+                // weighted: flux is strongest indicator of "interesting things happening".
+                const tensionDrive =
+                    Math.max(0, feat.volume.dev) * 1.0 +
+                    Math.max(0, feat.fullness.dev) * 1.2 +
+                    Math.max(0, feat.flux.dev) * 1.5 +
+                    Math.max(0, feat.onsetDensity.dev) * 0.6;
+                tension +=
+                    (tensionDrive * TENSION_GAIN - tension * TENSION_DECAY) *
+                    dt;
+                tension = Math.max(0, Math.min(TENSION_MAX, tension));
+
+                // ---- whiteout: four-way gated, modulated by tension, drains tension fast ----
+                // Whiteout = high intensity AND very high immediate novelty vs. long average.
+                // ALL four gates must simultaneously open for any whitening:
+                //   1. volume deviation VERY high (loud relative to ~20s mean)
+                //   2. fullness deviation VERY high (broadband relative to ~20s mean)
+                //   3. absolute volume genuinely loud (not just "loud for this quiet song")
+                //   4. tension well above 1.2 (sustained buildup across channels)
+                // gateOpen = product of four smoothstep gates → near zero unless every
+                // condition is well clear. Aim: 0–2 fires per song, only on real payoffs.
+                const volExc = smoothstep01(0.75, 1.0, feat.volume.dev);
+                const fullExc = smoothstep01(0.7, 1.0, feat.fullness.dev);
+                const loudEnough = smoothstep01(0.55, 0.9, feat.volume.short);
+                const tensionEnough = smoothstep01(1.2, 1.8, tension);
+                const gateOpen = volExc * fullExc * loudEnough * tensionEnough;
+                // capped at 0.65 — even at full gate, never fully white. Real ceiling is the
+                // shader-side clamp.
+                const whiteoutTarget = Math.min(0.65, gateOpen);
+                if (whiteoutTarget > uWhiteoutVal) {
+                    uWhiteoutVal +=
+                        (whiteoutTarget - uWhiteoutVal) * Math.min(1, dt * 6);
+                } else {
+                    uWhiteoutVal +=
+                        (whiteoutTarget - uWhiteoutVal) * Math.min(1, dt * 0.9);
+                }
+                // drain tension hard while firing so we can't sustain whiteout or re-fire soon
+                if (uWhiteoutVal > 0.2)
+                    tension = Math.max(0, tension - uWhiteoutVal * dt * 1.6);
+
+                // ---- brightness: sigmoid of absolute (auto-gained) volume ----
+                // Quiet music sections still produce visible viz. Only true silence cracks black.
+                // Saturates softly toward ~0.78, leaving headroom for additives + whiteout.
+                const absVol = volN; // already auto-gained band mean
+                const brightnessTarget =
+                    0.12 + 0.66 * smoothstep01(0.04, 0.55, absVol);
+                uBrightnessVal +=
+                    (brightnessTarget - uBrightnessVal) * Math.min(1, dt * 2.5);
+
+                // ---- energy: similar to brightness but with a small tension boost ----
+                const energyTarget =
+                    0.18 +
+                    0.62 * smoothstep01(0.04, 0.55, absVol) +
+                    0.1 * Math.min(1, tension * 0.6);
+                uEnergyVal +=
+                    (energyTarget - uEnergyVal) * Math.min(1, dt * 2.5);
+                uEnergyVal = Math.min(1.05, uEnergyVal);
+
+                // ---- beat presence: smoothed onset density gating glints/rings ----
+                const beatTarget = smoothstep01(
+                    0.6,
+                    2.6,
+                    feat.onsetDensity.short,
+                );
+                uBeatPresenceVal +=
+                    (beatTarget - uBeatPresenceVal) * Math.min(1, dt * 1.2);
+
+                slowPhase += dt * (0.05 + env.vol * 0.18);
+
+                if (now - segmentDriftAt > 22000) {
+                    segmentDriftAt = now;
+                    segments = 4 + Math.floor(Math.random() * 6);
+                }
+
+                // ---- regime switching (driven by multi-channel novelty) ----
+                const nov = noveltyNow();
+                if (
+                    nov > NOVELTY_THRESHOLD &&
+                    now - lastRegimeSwitchAt > REGIME_COOLDOWN_MS
+                ) {
+                    switchRegime(now);
+                    // collapse the short EMAs toward their long pair so we don't immediately re-trigger
+                    for (const k in feat) feat[k].short = feat[k].long;
+                }
+
+                // crossfade regime params toward target — exponential approach.
+                // RATE of 1.1 settles ~95% in ~2.7s, a felt but not abrupt transition.
+                const regimeK = 1 - Math.exp(-dt * 1.1);
+                for (const key of PARAM_KEYS) {
+                    regimeCur[key] +=
+                        (regimeTarget[key] - regimeCur[key]) * regimeK;
+                }
+
+                // switch flash decays fast (~0.7s)
+                switchFlash = Math.max(
+                    0,
+                    switchFlash - dt * 1.5 * Math.max(switchFlash, 0.3),
+                );
+
+                // palette crossfade — once mix completes, bake the target as the new current
+                if (palMix < 1) {
+                    palMix = Math.min(1, palMix + dt / PAL_SWAP_DURATION);
+                    if (palMix === 1) {
+                        palCurIdx = palNextIdx;
+                        palCur = flatPal(palCurIdx);
+                    }
+                }
+
+                updateSpectrum();
+
+                bv.textContent = env.bass.toFixed(2);
+                mv.textContent = env.mid.toFixed(2);
+                hv.textContent = env.hi.toFixed(2);
+                btsEl.textContent = uBeatPresenceVal.toFixed(2);
+                tnsEl.textContent = tension.toFixed(2);
+                whiEl.textContent = uWhiteoutVal.toFixed(2);
+                nv.textContent = nov.toFixed(2);
+
+                gl.uniform2f(U.res, canvas.width, canvas.height);
+                gl.uniform1f(U.time, t);
+                gl.uniform1f(U.bass, env.bass);
+                gl.uniform1f(U.mid, env.mid);
+                gl.uniform1f(U.hi, env.hi);
+                gl.uniform1f(U.bassRaw, raw.bass);
+                gl.uniform1f(U.midRaw, raw.mid);
+                gl.uniform1f(U.hiRaw, raw.hi);
+                gl.uniform1f(U.onBass, onset.bass);
+                gl.uniform1f(U.onMid, onset.mid);
+                gl.uniform1f(U.onHi, onset.hi);
+                gl.uniform1f(U.bounce, bounceY);
+                gl.uniform1f(U.centroid, centroidSmooth);
+                gl.uniform1f(U.beat, beatPhaseSmooth);
+                gl.uniform1f(U.slow, slowPhase);
+                gl.uniform1f(U.seg, segments);
+                gl.uniform3fv(U.palA, palCur);
+                gl.uniform3fv(U.palB, palNext);
+                gl.uniform1f(U.palMix, palMix);
+                gl.uniform1f(U.regSegOff, regimeCur.segOff);
+                gl.uniform1f(U.regTwist, regimeCur.twist);
+                gl.uniform1f(U.regWarp, regimeCur.warp);
+                gl.uniform1f(U.regRings, regimeCur.rings);
+                gl.uniform1f(U.regSparkle, regimeCur.sparkle);
+                gl.uniform1f(U.regRays, regimeCur.rays);
+                gl.uniform1f(U.regHue, regimeCur.hue);
+                gl.uniform1f(U.switchFlash, switchFlash);
+                gl.uniform1f(U.brightness, uBrightnessVal);
+                gl.uniform1f(U.energy, uEnergyVal);
+                gl.uniform1f(U.whiteout, uWhiteoutVal);
+                gl.uniform1f(U.beatPresence, uBeatPresenceVal);
+                gl.uniform4f(U.colMap, colMap.x, colMap.y, colMap.z, colMap.w);
+                gl.uniform1f(U.colBase, colBase);
+
+                gl.drawArrays(gl.TRIANGLES, 0, 3);
+                requestAnimationFrame(frame);
+            }
+
+            const startEl = document.getElementById("start");
+            async function go() {
+                startEl.classList.add("hidden");
+                await startAudio();
+                requestAnimationFrame(frame);
+                setTimeout(() => {
+                    if (startEl.parentNode) startEl.remove();
+                }, 800);
+            }
+            startEl.addEventListener("click", go);
+            addEventListener(
+                "keydown",
+                (e) => {
+                    if (e.key === " " || e.key === "Enter") go();
+                },
+                { once: true },
+            );
+
+            // On reload, if the mic permission is already granted (live-reload, refresh, etc.),
+            // skip the welcome card and jump straight back into the viz.
+            // AudioContext may still be suspended without a user gesture — if so, attach a
+            // one-shot listener that resumes it on the next interaction so audio reactivity
+            // kicks in as soon as the user does anything.
+            (async () => {
+                if (!navigator.permissions || !navigator.permissions.query)
+                    return;
+                let perm;
+                try {
+                    perm = await navigator.permissions.query({
+                        name: "microphone",
+                    });
+                } catch {
+                    return;
+                } // some browsers reject the 'microphone' name
+                if (perm.state !== "granted") return;
+                await go();
+                if (audioCtx && audioCtx.state !== "running") {
+                    const resumeOnce = () => audioCtx.resume();
+                    addEventListener("pointerdown", resumeOnce, { once: true });
+                    addEventListener("keydown", resumeOnce, { once: true });
+                }
+            })();
+        </script>
+    </body>
+</html>
