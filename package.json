@@ -1,0 +1,16 @@
+{
+  "name": "swirly-disco",
+  "version": "0.2.0",
+  "description": "single-file mic-reactive WebGL disco viz",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run dev.ts",
+    "build": "bun run build.ts",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  }
+}
