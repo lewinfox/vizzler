@@ -14,6 +14,10 @@
 
 import type { RegimeParams } from "../regimes/index.ts";
 
+// Audio + macro snapshot the orchestrator builds each frame and hands to
+// the active visualizer. Visualizers consume from this — they don't compute
+// audio themselves.
+
 export interface RenderContext {
   // viewport
   width: number;
@@ -69,10 +73,12 @@ export interface RenderContext {
 }
 
 export interface Visualizer<State = unknown> {
-  /** Unique identifier */
+  /** Unique identifier — referenced from Regime.visualizer */
   name: string;
   /** One-time setup; returns opaque per-visualizer state. */
   init(gl: WebGL2RenderingContext): State;
   /** Render one frame using the supplied context. */
   render(gl: WebGL2RenderingContext, state: State, ctx: RenderContext): void;
+  /** Optional cleanup when this visualizer is being swapped out for another. */
+  dispose?(gl: WebGL2RenderingContext, state: State): void;
 }

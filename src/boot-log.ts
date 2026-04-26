@@ -80,6 +80,7 @@ export function logBoot(): void {
     REGIMES.map((r, i) => ({
       idx: i,
       name: r.name,
+      visualizer: r.visualizer,
       ...r.p,
       palettes: r.palettes.join(","),
     })),

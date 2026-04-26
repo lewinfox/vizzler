@@ -51,9 +51,9 @@ import {
   onsetDensityNow,
 } from "./audio/onset-density.ts";
 
-import { REGIMES, PARAM_KEYS, type RegimeParams } from "./regimes/index.ts";
+import { REGIMES, type RegimeParams } from "./regimes/index.ts";
 import { pickNextRegime } from "./regimes/picker.ts";
-import { crossfadeRegime } from "./regimes/crossfade.ts";
+import { crossfadeRegime, snapRegime } from "./regimes/crossfade.ts";
 
 import { flatPal } from "./palettes/index.ts";
 import { makeColorMap, randomizeColorMap } from "./palettes/color-map.ts";
@@ -64,7 +64,6 @@ import type { RenderContext } from "./visualizers/types.ts";
 import { updateHud, setRegimeLabel } from "./ui/hud.ts";
 import { pushDash, drawDash } from "./ui/dashboard.ts";
 import { hideWelcomeCard, onUserGesture } from "./ui/welcome.ts";
-import { startLiveReload } from "./ui/live-reload.ts";
 
 import { logBoot } from "./boot-log.ts";
 
@@ -99,9 +98,10 @@ addEventListener("resize", resize);
 const spectrum = new SpectrumTexture(gl);
 const fluxTracker = new SpectralFlux();
 
-// ---- visualizer ----
-const visualizer = VISUALIZERS[DEFAULT_VISUALIZER];
-const vizState = visualizer.init(gl);
+// ---- visualizer (mutable — switches on cross-visualizer regime changes) ----
+let visualizerName = DEFAULT_VISUALIZER;
+let visualizer = VISUALIZERS[visualizerName];
+let vizState: unknown = visualizer.init(gl);
 
 // ---- audio state ----
 const env = { bass: 0, mid: 0, hi: 0, vol: 0 };
@@ -159,53 +159,108 @@ let lastRegimeSwitchAt = -100000;
 let switchFlash = 0;
 setRegimeLabel(REGIMES[regimeIdx].name);
 
-function switchRegime(now: number): void {
-  const prevName = REGIMES[regimeIdx].name;
-  const novInstant = noveltyNow(feat) * liveness;
-  const { idx: next, scores, heat } = pickNextRegime({
-    feat,
-    tension,
-    currentIdx: regimeIdx,
-  });
+// If the random initial regime targets a different visualizer than the
+// default, swap to it before the first frame runs.
+if (REGIMES[regimeIdx].visualizer !== visualizerName) {
+  visualizer.dispose?.(gl, vizState);
+  visualizerName = REGIMES[regimeIdx].visualizer;
+  visualizer = VISUALIZERS[visualizerName];
+  if (!visualizer) {
+    console.warn(`unknown visualizer "${visualizerName}", falling back`);
+    visualizerName = DEFAULT_VISUALIZER;
+    visualizer = VISUALIZERS[visualizerName];
+  }
+  vizState = visualizer.init(gl);
+}
 
-  console.groupCollapsed(
-    `%c⚡ regime: ${prevName} → ${REGIMES[next].name}`,
-    "color: #ffd166; font-weight: bold;",
-  );
-  const drive = Math.max(0, novInstant - P.NOVELTY_BOIL);
-  console.log(
-    `sustained: ${sustainedNovelty.toFixed(3)}  (threshold ${P.NOVELTY_THRESHOLD})  ·  instant: ${novInstant.toFixed(2)}  ·  drive: ${drive.toFixed(2)}  (boil ${P.NOVELTY_BOIL})`,
-  );
-  console.log(
-    `liveness: ${liveness.toFixed(2)}   tension: ${tension.toFixed(2)}   heat: ${heat.toFixed(2)}`,
-  );
-  console.log("dev snapshot (short - long, normalized to ±1):", {
-    volume: +feat.volume.dev.toFixed(2),
-    fullness: +feat.fullness.dev.toFixed(2),
-    flux: +feat.flux.dev.toFixed(2),
-    centroid: +feat.centroid.dev.toFixed(2),
-    onsetDensity: +feat.onsetDensity.dev.toFixed(2),
-  });
-  console.table(
-    REGIMES.map((r, i) => ({
-      regime: r.name,
-      score: scores[i] === -1 ? "(current)" : +scores[i].toFixed(3),
-      picked: i === next ? "★" : "",
-    })),
-  );
+// Apply a regime switch to a specific target index. Used by both the
+// automatic novelty-driven path and the manual "n" keyboard shortcut.
+// `auto` carries picker telemetry for the console log; absent when the
+// switch is forced manually.
+interface AutoSwitchInfo {
+  scores: number[];
+  heat: number;
+  novInstant: number;
+}
+
+function switchRegime(next: number, now: number, auto?: AutoSwitchInfo): void {
+  const prevName = REGIMES[regimeIdx].name;
+  const newRegime = REGIMES[next];
+
+  // ---- log the decision ----
+  const banner = auto
+    ? `%c⚡ regime: ${prevName} → ${newRegime.name}`
+    : `%c↳ manual regime: ${prevName} → ${newRegime.name}`;
+  console.groupCollapsed(banner, "color: #ffd166; font-weight: bold;");
+  if (auto) {
+    const drive = Math.max(0, auto.novInstant - P.NOVELTY_BOIL);
+    console.log(
+      `sustained: ${sustainedNovelty.toFixed(3)}  (threshold ${P.NOVELTY_THRESHOLD})  ·  instant: ${auto.novInstant.toFixed(2)}  ·  drive: ${drive.toFixed(2)}  (boil ${P.NOVELTY_BOIL})`,
+    );
+    console.log(
+      `liveness: ${liveness.toFixed(2)}   tension: ${tension.toFixed(2)}   heat: ${auto.heat.toFixed(2)}`,
+    );
+    console.log("dev snapshot (short - long, normalized to ±1):", {
+      volume: +feat.volume.dev.toFixed(2),
+      fullness: +feat.fullness.dev.toFixed(2),
+      flux: +feat.flux.dev.toFixed(2),
+      centroid: +feat.centroid.dev.toFixed(2),
+      onsetDensity: +feat.onsetDensity.dev.toFixed(2),
+    });
+    console.table(
+      REGIMES.map((r, i) => ({
+        regime: r.name,
+        score: auto.scores[i] === -1 ? "(current)" : +auto.scores[i].toFixed(3),
+        picked: i === next ? "★" : "",
+      })),
+    );
+  } else {
+    console.log("triggered by keyboard ('n' — uniform random)");
+  }
   console.groupEnd();
 
+  // ---- apply the switch ----
   regimeIdx = next;
-  Object.assign(regimeTarget, REGIMES[next].p);
   lastRegimeSwitchAt = now;
   switchFlash = 1;
-  const choices = REGIMES[next].palettes.filter((i) => i !== palCurIdx);
+
+  // Cross-visualizer switch: dispose the old viz, init the new one, snap
+  // params (no crossfade — different visualizers wouldn't lerp meaningfully).
+  if (newRegime.visualizer !== visualizerName) {
+    console.log(
+      `%c↻ visualizer: ${visualizerName} → ${newRegime.visualizer}`,
+      "color: #6cf; font-weight: bold;",
+    );
+    visualizer.dispose?.(gl, vizState);
+    visualizerName = newRegime.visualizer;
+    visualizer = VISUALIZERS[visualizerName] ?? VISUALIZERS[DEFAULT_VISUALIZER];
+    vizState = visualizer.init(gl);
+    snapRegime(regimeCur, newRegime.p);
+    snapRegime(regimeTarget, newRegime.p);
+  } else {
+    // Same visualizer — replace target so crossfade approaches the new params.
+    snapRegime(regimeTarget, newRegime.p);
+  }
+
+  const choices = newRegime.palettes.filter((i) => i !== palCurIdx);
   const pick = choices.length
     ? choices[(Math.random() * choices.length) | 0]
-    : REGIMES[next].palettes[0];
+    : newRegime.palettes[0];
   swapPaletteTo(pick);
   randomizeColorMap(colorMap);
-  setRegimeLabel(REGIMES[next].name);
+  setRegimeLabel(newRegime.name);
+}
+
+// Manual switch: pick any regime other than the current one with uniform
+// probability (bypasses heuristic scoring AND the cooldown). Resets
+// sustainedNovelty so we don't immediately retrigger on the next frame.
+function manualSwitchRegime(): void {
+  if (REGIMES.length < 2) return;
+  // index in [0, REGIMES.length - 1) → shift past current to ensure we pick a different one
+  let pick = Math.floor(Math.random() * (REGIMES.length - 1));
+  if (pick >= regimeIdx) pick++;
+  switchRegime(pick, performance.now());
+  sustainedNovelty = 0;
 }
 
 // ---- onset handler ----
@@ -416,7 +471,12 @@ function frame(now: number): void {
     nov > P.NOVELTY_THRESHOLD &&
     now - lastRegimeSwitchAt > P.REGIME_COOLDOWN_MS
   ) {
-    switchRegime(now);
+    const { idx, scores, heat } = pickNextRegime({
+      feat,
+      tension,
+      currentIdx: regimeIdx,
+    });
+    switchRegime(idx, now, { scores, heat, novInstant });
     for (const k in feat) {
       const ch = feat[k as keyof typeof feat];
       ch.short = ch.long;
@@ -513,6 +573,15 @@ async function go(): Promise<void> {
 }
 onUserGesture(go);
 
+// Keyboard shortcut: press "n" to force a uniformly-random regime switch.
+// Bypasses the heuristic picker AND the cooldown — useful for quickly
+// auditioning regimes or when you just want a change.
+window.addEventListener("keydown", (e: KeyboardEvent) => {
+  if ((e.key === "n" || e.key === "N") && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    manualSwitchRegime();
+  }
+});
+
 // On reload, if mic permission is already granted, jump straight back in.
 (async () => {
   if (!navigator.permissions || !navigator.permissions.query) return;
@@ -535,4 +604,3 @@ onUserGesture(go);
 })();
 
 logBoot();
-startLiveReload();

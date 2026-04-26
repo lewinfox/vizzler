@@ -1,2 +1,0 @@
-# Bun config — left intentionally minimal. The bundler config is on the CLI
-# in dev.ts and build.ts because it differs between dev and prod.

@@ -2,12 +2,13 @@
 // Conforms to the shared Visualizer interface so other visualizers can
 // be added alongside it later.
 
-import vsSource from "./shader.vert" with { type: "text" };
-import fsSource from "./shader.frag" with { type: "text" };
+import vsSource from "./shader.vert?raw";
+import fsSource from "./shader.frag?raw";
 import type { RenderContext, Visualizer } from "../types.ts";
 
 interface KState {
   prog: WebGLProgram;
+  vbo: WebGLBuffer;
   uniforms: Record<string, WebGLUniformLocation | null>;
 }
 
@@ -81,14 +82,13 @@ const kaleidoscope: Visualizer<KState> = {
 
     // Single full-screen triangle (oversized so it covers the viewport).
     const vbo = gl.createBuffer();
+    if (!vbo) throw new Error("could not create kaleidoscope VBO");
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
     gl.bufferData(
       gl.ARRAY_BUFFER,
       new Float32Array([-1, -1, 3, -1, -1, 3]),
       gl.STATIC_DRAW,
     );
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
     const uniforms: Record<string, WebGLUniformLocation | null> = {};
     for (const name of UNIFORM_NAMES) {
@@ -96,12 +96,17 @@ const kaleidoscope: Visualizer<KState> = {
     }
     gl.uniform1i(uniforms.uSpectrum, 0);
 
-    return { prog, uniforms };
+    return { prog, vbo, uniforms };
   },
 
   render(gl, state, ctx: RenderContext) {
     const { uniforms: U } = state;
     gl.useProgram(state.prog);
+    // (re)bind our VBO each frame — other visualizers may have bound their own.
+    gl.bindBuffer(gl.ARRAY_BUFFER, state.vbo);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.disable(gl.BLEND);
 
     gl.uniform2f(U.uRes, ctx.width, ctx.height);
     gl.uniform1f(U.uTime, ctx.time);
@@ -133,13 +138,13 @@ const kaleidoscope: Visualizer<KState> = {
     );
     gl.uniform1f(U.uColBase, ctx.colBase);
 
-    gl.uniform1f(U.uRegSegOff, ctx.regime.segOff);
-    gl.uniform1f(U.uRegTwist, ctx.regime.twist);
-    gl.uniform1f(U.uRegWarp, ctx.regime.warp);
-    gl.uniform1f(U.uRegRings, ctx.regime.rings);
-    gl.uniform1f(U.uRegSparkle, ctx.regime.sparkle);
-    gl.uniform1f(U.uRegRays, ctx.regime.rays);
-    gl.uniform1f(U.uRegHue, ctx.regime.hue);
+    gl.uniform1f(U.uRegSegOff, ctx.regime.segOff ?? 0);
+    gl.uniform1f(U.uRegTwist, ctx.regime.twist ?? 1.0);
+    gl.uniform1f(U.uRegWarp, ctx.regime.warp ?? 1.0);
+    gl.uniform1f(U.uRegRings, ctx.regime.rings ?? 1.0);
+    gl.uniform1f(U.uRegSparkle, ctx.regime.sparkle ?? 1.0);
+    gl.uniform1f(U.uRegRays, ctx.regime.rays ?? 1.0);
+    gl.uniform1f(U.uRegHue, ctx.regime.hue ?? 0);
 
     gl.uniform1f(U.uSwitchFlash, ctx.switchFlash);
     gl.uniform1f(U.uBrightness, ctx.brightness);
@@ -153,6 +158,11 @@ const kaleidoscope: Visualizer<KState> = {
     gl.bindTexture(gl.TEXTURE_2D, ctx.spectrumTexture);
 
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+  },
+
+  dispose(gl, state) {
+    gl.deleteProgram(state.prog);
+    gl.deleteBuffer(state.vbo);
   },
 };
 
