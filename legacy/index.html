@@ -34,6 +34,16 @@
                 text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
                 letter-spacing: 0.04em;
             }
+            #dash {
+                position: fixed;
+                left: 12px;
+                bottom: 32px;
+                width: 360px;
+                height: 84px;
+                opacity: 0.7;
+                pointer-events: none;
+                image-rendering: pixelated;
+            }
             #ui span {
                 display: inline-block;
                 min-width: 2.4em;
@@ -105,6 +115,7 @@
     </head>
     <body>
         <canvas id="c"></canvas>
+        <canvas id="dash" width="720" height="168"></canvas>
         <div id="ui">
             <span id="rg">DISCO FLOOR</span> · live
             <span id="liv">0.00</span> · bass <span id="bv">0.00</span> mid
@@ -270,7 +281,7 @@
             // Drives whiteout intensity + biases regime picker toward energetic
             // regimes. Whiteout firing drains it (see WHITEOUT_DRAIN_RATE).
             const TENSION_GAIN  = 0.22;  // how fast positive devs charge tension
-            const TENSION_DECAY = 0.08;  // 1/s — ~12s decay timeconstant when idle
+            const TENSION_DECAY = 0.20;  // 1/s — ~5s decay timeconstant when idle
             const TENSION_MAX   = 2.0;   // hard cap (so a long crescendo doesn't pin)
 
             // ---- Liveness gate (master "is anything actually playing") ----
@@ -289,11 +300,16 @@
             // whitening. Aim: 0–2 fires per song. Raise the lo bounds to make
             // whiteout rarer; lower to make easier. WHITEOUT_MAX caps the JS
             // value; the shader caps the on-screen mix at 0.55 separately.
-            const WHITEOUT_VOL_GATE     = [0.75, 1.00]; // smoothstep over feat.volume.dev
-            const WHITEOUT_FULL_GATE    = [0.70, 1.00]; // smoothstep over feat.fullness.dev
-            const WHITEOUT_LOUD_GATE    = [0.55, 0.90]; // smoothstep over feat.volume.short (absolute loud)
-            const WHITEOUT_TENSION_GATE = [1.20, 1.80]; // smoothstep over tension
-            const WHITEOUT_MAX          = 0.65;
+            // Gates tightened (~50% less propensity to fire). Each lo-bound bumped
+            // up by ~0.07 and tension floor raised from 1.2 → 1.45. Because gateOpen
+            // is the *product* of four smoothstep gates, the cumulative effect is
+            // much larger than any single tightening — fires roughly halve in
+            // frequency. WHITEOUT_MAX also halved so on-screen intensity is gentler.
+            const WHITEOUT_VOL_GATE     = [0.82, 1.00]; // smoothstep over feat.volume.dev
+            const WHITEOUT_FULL_GATE    = [0.78, 1.00]; // smoothstep over feat.fullness.dev
+            const WHITEOUT_LOUD_GATE    = [0.62, 0.92]; // smoothstep over feat.volume.short (absolute loud)
+            const WHITEOUT_TENSION_GATE = [1.45, 2.00]; // smoothstep over tension
+            const WHITEOUT_MAX          = 0.32;
             const WHITEOUT_DRAIN_RATE   = 1.6;          // 1/s — how fast firing drains tension
             const WHITEOUT_ATTACK_RATE  = 6.0;          // 1/s — fast snap-up on fire
             const WHITEOUT_RELEASE_RATE = 0.9;          // 1/s — slow release after fire
@@ -323,10 +339,31 @@
 
             // ---- Regimes & palette swaps ----
             const PAL_SWAP_DURATION    = 1.6;   // s — palette crossfade time on switch
-            const REGIME_COOLDOWN_MS   = 8000;  // min ms between regime switches
-            const NOVELTY_THRESHOLD    = 0.42;  // multi-channel novelty needed to switch
+            const REGIME_COOLDOWN_MS   = 5000;  // min ms between regime switches (hard floor)
+            // Novelty trigger uses a TWO-STAGE filter:
+            //
+            //  1. Per-channel emphasis: emphasis() returns 0 for |dev| ≤ NOVELTY_FLOOR
+            //     so steady autoscale fluctuation from a single channel contributes
+            //     nothing. Only genuinely-excursive devs make it through.
+            //
+            //  2. "Boil" integrator on the aggregate:
+            //         drive = max(0, instantNovelty - NOVELTY_BOIL)
+            //         sustained += (drive·HEAT_RATE - sustained·COOL_RATE) · dt
+            //     Below NOVELTY_BOIL, drive is 0 and sustained decays to zero —
+            //     it CAN'T climb on steady-state input no matter how long. Above
+            //     NOVELTY_BOIL, it climbs toward (drive·HEAT/COOL). Big drops
+            //     (instant ~3+) reach threshold in ~1s; moderate ~2s changes in
+            //     2-3s; normal music (instant 0..1) never climbs at all.
+            //
+            // Switch fires when sustained > NOVELTY_THRESHOLD AND cooldown elapsed.
+            const NOVELTY_FLOOR         = 0.65; // per-channel: |dev| below this counts as steady noise
+            const NOVELTY_BOIL          = 1.00; // aggregate: instant novelty below this can't charge sustained
+            const NOVELTY_HEAT_RATE     = 0.30; // 1/s — how fast sustained climbs above boil
+            const NOVELTY_COOL_RATE     = 0.40; // 1/s — how fast sustained decays
+            const NOVELTY_THRESHOLD     = 0.85; // sustained novelty needed to switch
+            const NOVELTY_MAX           = 3.0;  // hard cap on sustained value
             const REGIME_CROSSFADE_RATE = 1.1;  // 1/s — exp approach of regime params
-            const SWITCH_FLASH_DECAY   = 1.5;   // 1/s — decay of post-switch white kick
+            const SWITCH_FLASH_DECAY    = 1.5;  // 1/s — decay of post-switch white kick
 
             // ---- Misc timings ----
             const SEGMENTS_DRIFT_MS    = 22000; // ms between random base segment-count rerolls
@@ -876,6 +913,14 @@ registerProcessor('onset-processor', OnsetProcessor);
                 const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
                 return t * t * (3 - 2 * t);
             }
+            // Threshold-then-linear: returns 0 when |x| ≤ NOVELTY_FLOOR, scales
+            // linearly to 1.0 as |x| → 1. Lets noveltyNow() ignore baseline
+            // fluctuation and respond only to genuinely-excursive devs.
+            function emphasis(x) {
+                const a = Math.abs(x);
+                if (a <= NOVELTY_FLOOR) return 0;
+                return (a - NOVELTY_FLOOR) / (1 - NOVELTY_FLOOR);
+            }
 
             // per-band auto-gain (uses GAIN_DECAY from PARAMS section)
             const gain = { bass: 0.05, mid: 0.05, hi: 0.05 };
@@ -1145,12 +1190,17 @@ registerProcessor('onset-processor', OnsetProcessor);
                 "hue",
             ];
 
-            // current and target regime coefficient vectors — these lerp on a switch.
-            let regimeIdx = 0;
-            const regimeCur = { ...REGIMES[0].p };
-            const regimeTarget = { ...REGIMES[0].p };
+            // Random initial regime — variety on every reload. The HUD label is
+            // patched after rgEl is found further down. The current regime is
+            // never re-pickable, so this also seeds the natural rotation.
+            let regimeIdx = Math.floor(Math.random() * REGIMES.length);
+            const regimeCur = { ...REGIMES[regimeIdx].p };
+            const regimeTarget = { ...REGIMES[regimeIdx].p };
             // REGIME_COOLDOWN_MS / NOVELTY_THRESHOLD live in PARAMS
             let lastRegimeSwitchAt = -100000;
+            // smoothed novelty — what actually triggers regime switches.
+            // Integrated at NOVELTY_SUSTAIN_RATE so brief spikes don't fire.
+            let sustainedNovelty = 0;
 
             // ---------- console diagnostics ----------
             // Boot banner: dump every tweakable param + every regime + every palette.
@@ -1183,7 +1233,10 @@ registerProcessor('onset-processor', OnsetProcessor);
                     ENERGY_TENSION_BOOST, ENERGY_MAX,
                     BEAT_FOLLOW_RATE,
                     PAL_SWAP_DURATION, REGIME_COOLDOWN_MS,
-                    NOVELTY_THRESHOLD, REGIME_CROSSFADE_RATE,
+                    NOVELTY_FLOOR, NOVELTY_BOIL,
+                    NOVELTY_HEAT_RATE, NOVELTY_COOL_RATE,
+                    NOVELTY_THRESHOLD, NOVELTY_MAX,
+                    REGIME_CROSSFADE_RATE,
                     SWITCH_FLASH_DECAY, SEGMENTS_DRIFT_MS,
                 });
                 console.log("Range params (smoothstep [lo, hi]):", {
@@ -1243,16 +1296,17 @@ registerProcessor('onset-processor', OnsetProcessor);
 
             let switchFlash = 0; // decays after each switch
 
-            // novelty across the feature bus — sum of |dev| of the channels that matter
-            // for "the song just changed character". Used both for regime-switch detection
-            // and as one input to tension.
+            // novelty across the feature bus — weighted sum of *emphasized* |dev|s.
+            // emphasis() returns 0 below NOVELTY_FLOOR so steady-state autoscale
+            // fluctuation doesn't contribute. Real character changes (multiple
+            // channels excursive) drive this up; brief single-channel spikes don't.
             function noveltyNow() {
                 return (
-                    1.6 * Math.abs(feat.volume.dev) +
-                    1.4 * Math.abs(feat.fullness.dev) +
-                    1.6 * Math.abs(feat.flux.dev) +
-                    1.0 * Math.abs(feat.centroid.dev) +
-                    0.8 * Math.abs(feat.onsetDensity.dev)
+                    1.6 * emphasis(feat.volume.dev) +
+                    1.4 * emphasis(feat.fullness.dev) +
+                    1.6 * emphasis(feat.flux.dev) +
+                    1.0 * emphasis(feat.centroid.dev) +
+                    0.8 * emphasis(feat.onsetDensity.dev)
                 );
             }
 
@@ -1299,15 +1353,16 @@ registerProcessor('onset-processor', OnsetProcessor);
             function switchRegime(now) {
                 const prevName = REGIMES[regimeIdx].name;
                 const { idx: next, scores, heat } = pickNextRegime();
-                const novTrigger = noveltyNow() * liveness;
+                const novInstant = noveltyNow() * liveness;
 
                 // log the decision in a collapsible group so the console stays scannable
                 console.groupCollapsed(
                     `%c⚡ regime: ${prevName} → ${REGIMES[next].name}`,
                     "color: #ffd166; font-weight: bold;",
                 );
+                const drive = Math.max(0, novInstant - NOVELTY_BOIL);
                 console.log(
-                    `trigger novelty: ${novTrigger.toFixed(3)}  (threshold: ${NOVELTY_THRESHOLD})`,
+                    `sustained: ${sustainedNovelty.toFixed(3)}  (threshold ${NOVELTY_THRESHOLD})  ·  instant: ${novInstant.toFixed(2)}  ·  drive: ${drive.toFixed(2)}  (boil ${NOVELTY_BOIL})`,
                 );
                 console.log(
                     `liveness: ${liveness.toFixed(2)}   tension: ${tension.toFixed(2)}   heat: ${heat.toFixed(2)}`,
@@ -1413,6 +1468,155 @@ registerProcessor('onset-processor', OnsetProcessor);
             const whiEl = document.getElementById("whi");
             const livEl = document.getElementById("liv");
             const rgEl = document.getElementById("rg");
+            // sync HUD label with the random initial regimeIdx picked above
+            rgEl.textContent = REGIMES[regimeIdx].name;
+
+            // ---------- diagnostic dashboard (wireframe time-series + regime bar) ----------
+            // Three mini line graphs of the most useful real-time signals, plus a
+            // "regime change closeness" bar that reads novelty × cooldown progress.
+            // The closeness bar reaches 100% the moment the system is allowed to
+            // switch — useful for seeing how the system "decides" to change regime.
+            const dashCanvas = document.getElementById("dash");
+            const dx = dashCanvas.getContext("2d");
+            dx.scale(2, 2); // backing store is 2× CSS for crisp lines on retina
+            const DASH_W = 360,
+                DASH_H = 84;
+            const HIST_LEN = 240; // ~4s at 60fps
+            const hist = {
+                bass: new Float32Array(HIST_LEN),
+                mid: new Float32Array(HIST_LEN),
+                hi: new Float32Array(HIST_LEN),
+                liveness: new Float32Array(HIST_LEN),
+                tension: new Float32Array(HIST_LEN),
+                novelty: new Float32Array(HIST_LEN),
+                whiteout: new Float32Array(HIST_LEN),
+            };
+            let histPtr = 0;
+
+            function pushHist(snapshot) {
+                histPtr = (histPtr + 1) % HIST_LEN;
+                hist.bass[histPtr]     = snapshot.bass;
+                hist.mid[histPtr]      = snapshot.mid;
+                hist.hi[histPtr]       = snapshot.hi;
+                hist.liveness[histPtr] = snapshot.liveness;
+                hist.tension[histPtr]  = snapshot.tension;
+                hist.novelty[histPtr]  = snapshot.novelty;
+                hist.whiteout[histPtr] = snapshot.whiteout;
+            }
+
+            function drawLine(buf, x, y, w, h, vMin, vMax, color) {
+                dx.strokeStyle = color;
+                dx.lineWidth = 1;
+                dx.beginPath();
+                const range = vMax - vMin || 1;
+                for (let i = 0; i < HIST_LEN; i++) {
+                    // walk oldest → newest so the line scrolls right-to-left
+                    const idx = (histPtr + 1 + i) % HIST_LEN;
+                    const t = (buf[idx] - vMin) / range;
+                    const px = x + (i / (HIST_LEN - 1)) * w;
+                    const py = y + h - Math.max(0, Math.min(1, t)) * h;
+                    if (i === 0) dx.moveTo(px, py);
+                    else dx.lineTo(px, py);
+                }
+                dx.stroke();
+            }
+
+            function drawPanel(x, y, w, h, title, lines) {
+                // wireframe border + dim axis
+                dx.strokeStyle = "rgba(255,255,255,0.18)";
+                dx.lineWidth = 0.5;
+                dx.strokeRect(x + 0.5, y + 0.5, w, h);
+                // half-axis tick — shows midpoint of the panel's value range
+                dx.strokeStyle = "rgba(255,255,255,0.06)";
+                dx.beginPath();
+                dx.moveTo(x, y + h * 0.5);
+                dx.lineTo(x + w, y + h * 0.5);
+                dx.stroke();
+                // each series
+                for (const l of lines) drawLine(l.buf, x, y, w, h, l.min, l.max, l.color);
+                // title + legend
+                dx.font = "8px ui-monospace, Menlo, monospace";
+                dx.fillStyle = "rgba(255,255,255,0.4)";
+                dx.fillText(title, x + 3, y + 9);
+                let lx = x + w - 3;
+                for (let i = lines.length - 1; i >= 0; i--) {
+                    const txt = lines[i].label;
+                    dx.fillStyle = lines[i].color;
+                    const tw = dx.measureText(txt).width;
+                    dx.fillText(txt, lx - tw, y + 9);
+                    lx -= tw + 6;
+                }
+            }
+
+            function drawDash(now) {
+                dx.clearRect(0, 0, DASH_W, DASH_H);
+                const PAD = 4, GAP = 6;
+                const panelW = (DASH_W - PAD * 2 - GAP * 2) / 3;
+                const panelH = 44;
+                const panelY = PAD;
+
+                drawPanel(PAD, panelY, panelW, panelH, "bands", [
+                    { buf: hist.bass, label: "bass", color: "#ff63c8", min: 0, max: 1 },
+                    { buf: hist.mid,  label: "mid",  color: "#ffd166", min: 0, max: 1 },
+                    { buf: hist.hi,   label: "hi",   color: "#6cf",    min: 0, max: 1 },
+                ]);
+                drawPanel(PAD + panelW + GAP, panelY, panelW, panelH, "state", [
+                    { buf: hist.liveness, label: "live", color: "#6f6", min: 0, max: 1 },
+                    { buf: hist.tension,  label: "tens", color: "#fff", min: 0, max: TENSION_MAX },
+                ]);
+                drawPanel(PAD + (panelW + GAP) * 2, panelY, panelW, panelH, "triggers", [
+                    // novelty graph max = 2× threshold so the line has headroom when drives are big
+                    { buf: hist.novelty,  label: "nov", color: "#ffd166",
+                      min: 0, max: NOVELTY_THRESHOLD * 2 },
+                    { buf: hist.whiteout, label: "whi", color: "#fff", min: 0, max: 1 },
+                ]);
+
+                // ---- regime closeness bar ----
+                // closeness = cooldownProgress × noveltyRatio, both clamped 0..1.
+                // hits 100% the moment a regime switch is allowed to fire.
+                const cooldownProg = Math.min(
+                    1,
+                    (now - lastRegimeSwitchAt) / REGIME_COOLDOWN_MS,
+                );
+                const novRatio = Math.min(
+                    1,
+                    hist.novelty[histPtr] / NOVELTY_THRESHOLD,
+                );
+                const closeness = cooldownProg * novRatio;
+
+                const barX = PAD + 56;
+                const barY = panelY + panelH + 8;
+                const barW = DASH_W - barX - PAD - 32;
+                const barH = 10;
+                dx.font = "9px ui-monospace, Menlo, monospace";
+                dx.fillStyle = "rgba(255,255,255,0.55)";
+                dx.fillText("regime →", PAD, barY + 8);
+                // bar frame
+                dx.strokeStyle = "rgba(255,255,255,0.20)";
+                dx.lineWidth = 0.5;
+                dx.strokeRect(barX + 0.5, barY + 0.5, barW, barH);
+                // fill — color shifts toward hot as we approach 100%
+                const fillW = Math.max(0, barW - 2) * closeness;
+                dx.fillStyle =
+                    closeness > 0.95
+                        ? "#ffd166"
+                        : closeness > 0.6
+                          ? "rgba(255,209,102,0.6)"
+                          : "rgba(108, 204, 255, 0.5)";
+                dx.fillRect(barX + 1, barY + 1, fillW, barH - 2);
+                // tick at the cooldown-elapsed point so you can see WHICH gate is the bottleneck
+                if (cooldownProg < 1) {
+                    dx.strokeStyle = "rgba(255,90,200,0.6)";
+                    dx.beginPath();
+                    dx.moveTo(barX + barW * cooldownProg, barY - 1);
+                    dx.lineTo(barX + barW * cooldownProg, barY + barH + 1);
+                    dx.stroke();
+                }
+                // numeric percent
+                dx.fillStyle = "rgba(255,255,255,0.85)";
+                const pctText = Math.round(closeness * 100) + "%";
+                dx.fillText(pctText, barX + barW + 5, barY + 8);
+            }
 
             const t0 = performance.now();
             let lastFrame = t0;
@@ -1624,16 +1828,29 @@ registerProcessor('onset-processor', OnsetProcessor);
                     segments = 4 + Math.floor(Math.random() * 6); // 4..9
                 }
 
-                // ---- regime switching (driven by multi-channel novelty) ----
-                // Gated by liveness so a silent room can't flip regimes from noise.
-                const nov = noveltyNow() * liveness;
+                // ---- regime switching (boil model) ----
+                // Per-channel emphasis (NOVELTY_FLOOR) filters single-channel noise.
+                // Aggregate "boil" integrator: drive = max(0, instant - BOIL).
+                // sustained climbs only when drive > 0 (real multi-channel excursion),
+                // decays otherwise. Steady music = drive 0 = sustained always 0.
+                const novInstant = noveltyNow() * liveness;
+                const drive = Math.max(0, novInstant - NOVELTY_BOIL);
+                sustainedNovelty +=
+                    (drive * NOVELTY_HEAT_RATE -
+                        sustainedNovelty * NOVELTY_COOL_RATE) *
+                    dt;
+                sustainedNovelty = Math.max(
+                    0,
+                    Math.min(NOVELTY_MAX, sustainedNovelty),
+                );
+                const nov = sustainedNovelty;
                 if (
                     nov > NOVELTY_THRESHOLD &&
                     now - lastRegimeSwitchAt > REGIME_COOLDOWN_MS
                 ) {
                     switchRegime(now);
-                    // collapse the short EMAs toward their long pair so we don't immediately re-trigger
                     for (const k in feat) feat[k].short = feat[k].long;
+                    sustainedNovelty = 0;
                 }
 
                 // crossfade regime params toward target — exponential approach.
@@ -1670,6 +1887,18 @@ registerProcessor('onset-processor', OnsetProcessor);
                 tnsEl.textContent = tension.toFixed(2);
                 whiEl.textContent = uWhiteoutVal.toFixed(2);
                 nv.textContent = nov.toFixed(2);
+
+                // diagnostic dashboard — push current snapshot, redraw
+                pushHist({
+                    bass: env.bass,
+                    mid: env.mid,
+                    hi: env.hi,
+                    liveness,
+                    tension,
+                    novelty: nov,
+                    whiteout: uWhiteoutVal,
+                });
+                drawDash(now);
 
                 gl.uniform2f(U.res, canvas.width, canvas.height);
                 gl.uniform1f(U.time, t);
