@@ -281,7 +281,7 @@
             // Drives whiteout intensity + biases regime picker toward energetic
             // regimes. Whiteout firing drains it (see WHITEOUT_DRAIN_RATE).
             const TENSION_GAIN  = 0.22;  // how fast positive devs charge tension
-            const TENSION_DECAY = 0.08;  // 1/s — ~12s decay timeconstant when idle
+            const TENSION_DECAY = 0.20;  // 1/s — ~5s decay timeconstant when idle
             const TENSION_MAX   = 2.0;   // hard cap (so a long crescendo doesn't pin)
 
             // ---- Liveness gate (master "is anything actually playing") ----
